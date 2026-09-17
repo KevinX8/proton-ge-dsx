@@ -8,6 +8,8 @@ concurrency:
 
 jobs:
   version:
+    # Fork guard: see release.yml. Manual dev builds stay upstream-only.
+    if: github.repository == 'GloriousEggroll/proton-ge-custom'
     name: Version
     runs-on: ubuntu-latest
     outputs:

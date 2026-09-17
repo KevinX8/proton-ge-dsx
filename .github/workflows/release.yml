@@ -13,12 +13,16 @@ concurrency:
 
 jobs:
   build:
+    # Fork guard: GE's own release pipeline must only run upstream. The
+    # fork publishes DSX releases (any tag) and must never trigger this.
+    if: github.repository == 'GloriousEggroll/proton-ge-custom'
     name: Build
     uses: ./.github/workflows/_job_build.yml
     with:
       name: ${{ github.ref_name }}
 
   release:
+    if: github.repository == 'GloriousEggroll/proton-ge-custom'
     name: Release
     needs: build
     runs-on: ubuntu-latest
@@ -49,6 +53,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         
   upload:
+    if: github.repository == 'GloriousEggroll/proton-ge-custom'
     name: Upload
     needs: release
     strategy:

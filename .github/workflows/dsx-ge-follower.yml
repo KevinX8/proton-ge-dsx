@@ -1,0 +1,205 @@
+# DSX-GE follower build: rebuilds DSX-GE when upstream GE-Proton cuts a release.
+#
+# GitHub has no cross-repo release trigger, so this polls the upstream
+# releases API on a schedule and builds only when the version moved. The
+# version check is cheap (two API calls, same repo token); the heavy
+# build runs solely on a new upstream tag or a manual dispatch.
+#
+# Release format matches the existing manual releases: tag "11.5" (GE tag
+# "GE-Proton11-5" with the prefix stripped and dashes dotted), title
+# "Proton-GE-DSX-11.5", tarball + sha256 + GUI manifest as assets.
+#
+# Self-contained by design: GE's own release/devel workflows are guarded
+# to run upstream-only, so our tags and releases never trigger them, and
+# publishing here uses GITHUB_TOKEN (same repo - no PAT needed).
+#
+# Pipeline:
+#   1. compare upstream latest tag vs our latest release -> skip if equal
+#   2. fetch the upstream tag WITHOUT creating tag refs (a pushed
+#      GE-Proton* tag would fire GE's own release workflow), checkout
+#      detached, init submodules
+#   3. shallow-clone DualsenseXLinux for proton-patches + tools, regenerate
+#      the proton-script hook patch (anchor drift fails fast with
+#      instructions instead of silently shipping a hookless build)
+#   4. stage patches, protonprep, GE's own configure + make redist
+#   5. repack to the DSX-GE/ layout, package (refuses hookless builds),
+#      publish the release + manifest the GUI polls
+
+name: dsx-ge-follower
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      ge_tag:
+        description: "Upstream tag to build, e.g. GE-Proton11-5 (default: latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this version is already published"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  UPSTREAM_REPO: GloriousEggroll/proton-ge-custom
+  DSX_REPO: KevinX8/DualsenseXLinux
+  # GE develops on Arch; keep the build env close to that. If the build
+  # step goes red on dependencies, this image (or its pacman list) is the
+  # first place to look - everything else is pinned by our own scripts.
+  BUILD_IMAGE: archlinux:latest
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+      ge_tag: ${{ steps.compare.outputs.ge_tag }}
+      version: ${{ steps.compare.outputs.version }}
+    steps:
+      - name: Compare upstream tag against our releases
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.ge_tag }}" ]; then
+            ge_tag="${{ inputs.ge_tag }}"
+          else
+            ge_tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          fi
+          # GE-Proton11-5 -> 11.5, matching our existing release tags.
+          version="${ge_tag#GE-Proton}"
+          version="${version//-/.}"
+          published=$(gh release list --limit 100 --json tagName --jq '.[].tagName' | grep -xF "$version" || true)
+          echo "upstream_tag=$ge_tag version=$version published=$([ -n "$published" ] && echo yes || echo no)"
+          if [ "${{ inputs.force }}" = "true" ] || [ -z "$published" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "ge_tag=$ge_tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ env.BUILD_IMAGE }}
+      options: --privileged
+    timeout-minutes: 360
+    env:
+      GE_TAG: ${{ needs.check.outputs.ge_tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Install base tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git python3 curl jq ccache \
+            bison flex meson ninja mingw-w64-gcc fontconfig alsa-lib libpulse 2>&1 | tail -2
+
+      - name: Fetch upstream tag without creating tag refs
+        # A pushed GE-Proton* tag would fire GE's own release workflow, so
+        # the tag is fetched into a throwaway ref and never pushed anywhere.
+        run: |
+          set -euo pipefail
+          git init pgc && cd pgc
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch --depth 1 upstream "refs/tags/$GE_TAG:refs/dsx-build/$GE_TAG"
+          git checkout "refs/dsx-build/$GE_TAG"
+          git submodule update --init --depth 1 --jobs "$(nproc)"
+
+      - name: Clone DSX repo for patches and tools
+        run: |
+          git clone --depth 1 "https://github.com/$DSX_REPO.git" dsx
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: dsx-ge-ccache-${{ env.GE_TAG }}
+          restore-keys: dsx-ge-ccache-
+
+      - name: Regenerate hook patch and stage DSX patches
+        run: |
+          set -euo pipefail
+          HOOK=proton-patches/proton/0014-proton-auto-enable-dsx-proxy.patch
+          python3 dsx/tools/gen_proton_hook_patch.py "$GITHUB_WORKSPACE/pgc" "$GITHUB_WORKSPACE/regen.patch"
+          if ! diff -q "dsx/$HOOK" "$GITHUB_WORKSPACE/regen.patch" >/dev/null; then
+            echo "FAIL: upstream moved the proton-script anchor; $HOOK is stale."
+            echo "Regenerate locally and commit to DualsenseXLinux first:"
+            echo "  python3 tools/gen_proton_hook_patch.py proton-ge-custom \\"
+            echo "      proton-patches/proton/0014-proton-auto-enable-dsx-proxy.patch"
+            exit 1
+          fi
+          (cd dsx && tools/sync-proton-patches.sh "$GITHUB_WORKSPACE/pgc")
+
+      - name: protonprep
+        working-directory: pgc
+        run: |
+          set -euo pipefail
+          ./patches/protonprep-valve-staging.sh >"$GITHUB_WORKSPACE/patchlog.txt" 2>&1 || {
+            grep -iE "fail|error" "$GITHUB_WORKSPACE/patchlog.txt" | head -20
+            exit 1
+          }
+          # Patch noise ("0 failed", "no errors") must not fail the build.
+          if grep -iE "fail|error|hunk|can't find|not found" "$GITHUB_WORKSPACE/patchlog.txt" \
+              | grep -viE "0 fail|0 error|no .*fail" | head -5; then
+            echo "patch failures detected"; exit 1
+          fi
+          grep -A4 'WINE: -DSX-' "$GITHUB_WORKSPACE/patchlog.txt" | head -8
+          echo "protonprep clean"
+
+      - name: Build redist
+        working-directory: pgc
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          mkdir -p build && cd build
+          ccache -z || true
+          ../configure.sh --build-name="$GE_TAG"
+          nice make -j"$(nproc)" redist
+          ccache -s || true
+          test "$(ls -1 ./*.tar.gz | wc -l)" -eq 1
+          ls -la ./*.tar.gz
+
+      - name: Stage DSX-GE layout
+        # GE's tarball carries its own top dir and version file. Repack it
+        # the way package-dsx-ge.sh (and the GUI) expects: top-level DSX-GE/
+        # with a version file whose second field is our release version.
+        run: |
+          set -euo pipefail
+          rm -rf stage && mkdir -p stage
+          tar xzf "$GITHUB_WORKSPACE"/pgc/build/*.tar.gz -C stage
+          test "$(ls -1 stage | wc -l)" -eq 1
+          mv "stage/$(ls -1 stage)" stage/DSX-GE
+          echo "$(date +%s) $VERSION" > stage/DSX-GE/version
+          grep -q 'BEGIN DSX PROXY HOOK' stage/DSX-GE/proton
+          tar czf "$GITHUB_WORKSPACE/DSX-GE.tar.gz" -C stage DSX-GE
+          ls -la "$GITHUB_WORKSPACE/DSX-GE.tar.gz"
+
+      - name: Package DSX-GE
+        working-directory: dsx
+        env:
+          DSX_GE_BASE_URL: https://github.com/${{ github.repository }}/releases/latest/download
+        run: |
+          set -euo pipefail
+          tools/package-dsx-ge.sh "$GITHUB_WORKSPACE/DSX-GE.tar.gz" dist
+          cat dist/dsx-ge-latest.json
+
+      - name: Publish release
+        # Same repo: GITHUB_TOKEN suffices. Tag "11.5" matches the existing
+        # manual release format and never matches GE's GE-Proton* patterns.
+        working-directory: dsx/dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          manifest=$(cat dsx-ge-latest.json)
+          filename=$(echo "$manifest" | jq -r .filename)
+          gh release create "$VERSION" "$filename" "$filename.sha256" dsx-ge-latest.json \
+            --title "Proton-GE-DSX-$VERSION" --latest \
+            --notes "DSX-GE follower build of upstream $GE_TAG with the DSX proxy hook and UHID container-ID patches."
