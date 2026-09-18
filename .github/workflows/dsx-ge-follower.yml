@@ -13,12 +13,15 @@
 # to run upstream-only, so our tags and releases never trigger them, and
 # publishing here uses GITHUB_TOKEN (same repo - no PAT needed).
 #
-# Pipeline:
+# Pipeline (Ubuntu host, same shape as GE's own CI):
 #   1. compare upstream latest tag vs our latest release -> skip if equal
 #   2. fetch the upstream tag WITHOUT creating tag refs (a pushed
 #      GE-Proton* tag would fire GE's own release workflow), checkout
 #      detached, init submodules
-#   4. stage patches, protonprep, GE's own configure + make redist
+#   3. hook unit tests + patch drift gate (fails in seconds, not hours)
+#   4. stage patches, protonprep, then GE's own configure + make redist
+#      INSIDE the Steam Runtime container (--container-engine=docker), so
+#      the host needs no Wine toolchain at all
 #   5. repack to the DSX-GE/ layout, package (refuses hookless builds),
 #      publish the release + manifest the GUI polls
 
@@ -93,18 +96,40 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    container:
-      image: archlinux:latest
-      options: --privileged
     timeout-minutes: 360
     env:
       GE_TAG: ${{ needs.check.outputs.ge_tag }}
       VERSION: ${{ needs.check.outputs.version }}
     steps:
-      - name: Install base tools
+      - name: Free disk space
+        # A Proton redist plus the Steam Runtime build image need room the
+        # stock runner doesn't have. Same cleanup GE's own build runs.
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_codeql: true
+          remove_docker_images: true
+          remove_swap: true
+          remove_packages: |
+            azure-cli google-cloud-cli google-chrome-stable firefox microsoft-edge-stable
+            postgresql* mysql* php* temurin-* *llvm* clang* mono-devel powershell dotnet-sdk-*
+          remove_folders: |
+            /usr/share/swift /usr/share/miniconda /usr/local/lib/node_modules
+            /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia*
+            /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle /usr/share/az*
+            /usr/local/.ghcup
+
+      - name: Install host tools
+        # The build itself runs inside GE's Steam Runtime container (same as
+        # GE's own CI), so the host only needs the tools that run outside it:
+        # ccache storage, the DSX hook tests, and the release tooling.
         run: |
-          pacman -Syu --noconfirm --needed base-devel git github-cli python3 python-pytest curl jq ccache \
-            bison flex meson ninja mingw-w64-gcc fontconfig alsa-lib libpulse
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ccache fontforge-nox python3-pytest
 
       - uses: actions/checkout@v4
         with:
@@ -170,14 +195,18 @@ jobs:
           echo "protonprep clean"
 
       - name: Build redist
+        # Inside GE's Steam Runtime container, exactly like GE's own CI -
+        # no host toolchain involved. The strip-binaries patch keeps the
+        # runner disk footprint down, same as upstream.
         working-directory: pgc
         run: |
           set -euo pipefail
+          patch -Np1 -i ../.github/patches/0001-build-strip-binaries-early.patch
           df -h / | tail -1
           mkdir -p build && cd build
           ccache -z || true
-          ../configure.sh --build-name="$GE_TAG"
-          nice make -j"$(nproc)" redist
+          ../configure.sh --build-name="$GE_TAG" --container-engine=docker
+          make -j"$(nproc)" redist
           ccache -s || true
           test "$(ls -1 ./*.tar.gz | wc -l)" -eq 1
           ls -la ./*.tar.gz
