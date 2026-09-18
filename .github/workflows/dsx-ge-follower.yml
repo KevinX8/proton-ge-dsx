@@ -121,7 +121,13 @@ jobs:
           git -C pgc remote add upstream "https://github.com/$UPSTREAM_REPO.git"
           git -C pgc fetch --depth 1 upstream "refs/tags/$GE_TAG:refs/dsx-build/$GE_TAG"
           git -C pgc checkout "refs/dsx-build/$GE_TAG"
-          git -C pgc submodule update --init --depth 1 --jobs "$(nproc)"
+          # Submodules need real history, not --depth 1: protonprep reverts
+          # wine commit e813ca57, ~21k commits behind the tip, and a shallow
+          # clone fails that with "fatal: bad object". --filter=tree:0 keeps
+          # the history while still skipping the blobs, same as GE's own
+          # build workflow does.
+          git -C pgc submodule update --init --filter=tree:0 --recursive \
+            --jobs "$(nproc)"
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -150,7 +156,9 @@ jobs:
         run: |
           set -euo pipefail
           ./patches/protonprep-valve-staging.sh >"$GITHUB_WORKSPACE/patchlog.txt" 2>&1 || {
-            grep -iE "fail|error" "$GITHUB_WORKSPACE/patchlog.txt" | head -20
+            # git reports failures with "fatal:", which matches neither
+            # "fail" nor "error" - dump the tail so the log is never empty.
+            tail -30 "$GITHUB_WORKSPACE/patchlog.txt"
             exit 1
           }
           # Patch noise ("0 failed", "no errors") must not fail the build.
