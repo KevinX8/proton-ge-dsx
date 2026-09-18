@@ -6,3 +6,6 @@
 
 /.vagrant/
 /vagrant_share/
+
+# Python bytecode from the DSX tooling tests
+__pycache__/

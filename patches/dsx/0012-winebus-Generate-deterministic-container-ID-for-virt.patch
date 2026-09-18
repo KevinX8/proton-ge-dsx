@@ -1,0 +1,52 @@
+From 64ef58322829e192ffe86c7ed0a4c7e92f7cd542 Mon Sep 17 00:00:00 2001
+From: Paulis G <pgnmaster24@gmail.com>
+Date: Sat, 18 Apr 2026 11:57:50 +0200
+Subject: [PATCH 12/13] winebus: Generate deterministic container ID for
+ virtual DualSense devices
+
+Virtual HID devices created via uhid have no USB parent in sysfs,
+causing udev_device_get_parent_with_subsystem_devtype() to fail and
+the container ID to fall back to a random GUID. This prevents games
+from linking the HID controller to its associated audio endpoint.
+
+When the sysfs walk fails but VID/PID matches a DualSense controller
+(054C:0CE6 or 054C:0DF2), generate a deterministic container ID from
+VID/PID alone. This ensures the HID device and its virtual audio
+endpoint (null-sink) share the same container ID.
+---
+ dlls/winebus.sys/bus_udev.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winebus.sys/bus_udev.c b/dlls/winebus.sys/bus_udev.c
+index 0d54318b202..9a89d64eeac 100644
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1685,7 +1685,24 @@ static void get_container_id_for_usb_udev_device(struct udev_device *dev, struct
+     vid = pid = version = 0;
+     if (!(parent = udev_device_get_parent_with_subsystem_devtype(dev, "usb", "usb_device")))
+     {
+-        ERR("Failed to get parent device.\n");
++        /* Virtual HID devices (uhid) have no USB parent in sysfs.
++         * For DualSense proxy devices, generate a deterministic container ID
++         * from VID/PID so the audio endpoint can be linked by the game. */
++        if (desc->vid == 0x054c && (desc->pid == 0x0ce6 || desc->pid == 0x0df2))
++        {
++            desc->bus_container_id.Data1 = MAKELONG(desc->vid, desc->pid);
++            desc->bus_container_id.Data2 = 0;
++            desc->bus_container_id.Data3 = 0;
++            memset(desc->bus_container_id.Data4, 0, sizeof(desc->bus_container_id.Data4));
++            desc->bus_container_id.Data4[0] = 'D';
++            desc->bus_container_id.Data4[1] = 'S';
++            TRACE("Using deterministic DualSense container ID %s for virtual device.\n",
++                    debugstr_guid(&desc->bus_container_id));
++        }
++        else
++        {
++            ERR("Failed to get parent device.\n");
++        }
+         return;
+     }
+ 
+-- 
+2.53.0
+

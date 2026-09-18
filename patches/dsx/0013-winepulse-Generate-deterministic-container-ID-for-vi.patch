@@ -1,0 +1,50 @@
+From 21ad8263ae447e518290ca1b0c0b6423eabb19c3 Mon Sep 17 00:00:00 2001
+From: Paulis G <pgnmaster24@gmail.com>
+Date: Sat, 18 Apr 2026 11:57:50 +0200
+Subject: [PATCH 13/13] winepulse: Generate deterministic container ID for
+ virtual DualSense audio
+
+Virtual PulseAudio sinks (module-null-sink) used to proxy DualSense
+audio have no real sysfs path, so get_container_id() returns GUID_NULL.
+This prevents games from discovering the audio endpoint as belonging
+to the DualSense controller.
+
+When sysfs-based container ID generation fails but VID/PID from the
+PulseAudio proplist matches a DualSense controller, generate the same
+deterministic container ID used by the winebus HID side. This allows
+games to link controller and audio via matching container IDs.
+---
+ dlls/winepulse.drv/pulse.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index c051a9a2e1f..8a91340ee81 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -677,6 +677,23 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
+ 
+     if ((buffer = pa_proplist_gets(p, "sysfs.path")))
+         dev->container_id = get_container_id(buffer);
++
++    /* For virtual DualSense devices (e.g. null-sink proxying BT controller),
++     * sysfs walk fails because there is no real USB parent device.
++     * Generate a deterministic container ID from VID/PID so the game can
++     * link this audio endpoint to the uhid HID controller device. */
++    if (IsEqualGUID(&dev->container_id, &GUID_NULL) && dev->vendor_id == 0x054c
++            && (dev->product_id == 0x0ce6 || dev->product_id == 0x0df2))
++    {
++        dev->container_id.Data1 = MAKELONG(dev->vendor_id, dev->product_id);
++        dev->container_id.Data2 = 0;
++        dev->container_id.Data3 = 0;
++        memset(dev->container_id.Data4, 0, sizeof(dev->container_id.Data4));
++        dev->container_id.Data4[0] = 'D';
++        dev->container_id.Data4[1] = 'S';
++        TRACE("Using deterministic DualSense container ID %s for virtual device.\n",
++                debugstr_guid(&dev->container_id));
++    }
+ }
+ 
+ static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
+-- 
+2.53.0
+

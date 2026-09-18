@@ -18,9 +18,6 @@
 #   2. fetch the upstream tag WITHOUT creating tag refs (a pushed
 #      GE-Proton* tag would fire GE's own release workflow), checkout
 #      detached, init submodules
-#   3. shallow-clone DualsenseXLinux for proton-patches + tools, regenerate
-#      the proton-script hook patch (anchor drift fails fast with
-#      instructions instead of silently shipping a hookless build)
 #   4. stage patches, protonprep, GE's own configure + make redist
 #   5. repack to the DSX-GE/ layout, package (refuses hookless builds),
 #      publish the release + manifest the GUI polls
@@ -42,13 +39,16 @@ on:
         required: false
         default: false
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 env:
   UPSTREAM_REPO: GloriousEggroll/proton-ge-custom
-  DSX_REPO: KevinX8/DualsenseXLinux
-  # GE develops on Arch; keep the build env close to that. If the build
-  # step goes red on dependencies, this image (or its pacman list) is the
-  # first place to look - everything else is pinned by our own scripts.
-  BUILD_IMAGE: archlinux:latest
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   check:
@@ -62,19 +62,22 @@ jobs:
         id: compare
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_GE_TAG: ${{ inputs.ge_tag }}
+          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          if [ -n "${{ inputs.ge_tag }}" ]; then
-            ge_tag="${{ inputs.ge_tag }}"
+          if [ -n "$REQUESTED_GE_TAG" ]; then
+            ge_tag="$REQUESTED_GE_TAG"
           else
             ge_tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
           fi
+          [[ "$ge_tag" =~ ^GE-Proton[0-9]+(-[0-9]+)+$ ]] || { echo "Invalid GE tag" >&2; exit 1; }
           # GE-Proton11-5 -> 11.5, matching our existing release tags.
           version="${ge_tag#GE-Proton}"
           version="${version//-/.}"
           published=$(gh release list --limit 100 --json tagName --jq '.[].tagName' | grep -xF "$version" || true)
           echo "upstream_tag=$ge_tag version=$version published=$([ -n "$published" ] && echo yes || echo no)"
-          if [ "${{ inputs.force }}" = "true" ] || [ -z "$published" ]; then
+          if [ "$FORCE" = "true" ] || [ -z "$published" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"
@@ -88,8 +91,10 @@ jobs:
     needs: check
     if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     container:
-      image: ${{ env.BUILD_IMAGE }}
+      image: archlinux:latest
       options: --privileged
     timeout-minutes: 360
     env:
@@ -98,23 +103,25 @@ jobs:
     steps:
       - name: Install base tools
         run: |
-          pacman -Syu --noconfirm --needed base-devel git python3 curl jq ccache \
-            bison flex meson ninja mingw-w64-gcc fontconfig alsa-lib libpulse 2>&1 | tail -2
+          pacman -Syu --noconfirm --needed base-devel git github-cli python3 python-pytest curl jq ccache \
+            bison flex meson ninja mingw-w64-gcc fontconfig alsa-lib libpulse
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Fetch upstream tag without creating tag refs
         # A pushed GE-Proton* tag would fire GE's own release workflow, so
         # the tag is fetched into a throwaway ref and never pushed anywhere.
+        # This repo's own tools/ and patches/ stay checked out at HEAD; only
+        # pgc/ moves to the upstream tag.
         run: |
           set -euo pipefail
-          git init pgc && cd pgc
-          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
-          git fetch --depth 1 upstream "refs/tags/$GE_TAG:refs/dsx-build/$GE_TAG"
-          git checkout "refs/dsx-build/$GE_TAG"
-          git submodule update --init --depth 1 --jobs "$(nproc)"
-
-      - name: Clone DSX repo for patches and tools
-        run: |
-          git clone --depth 1 "https://github.com/$DSX_REPO.git" dsx
+          git init pgc
+          git -C pgc remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git -C pgc fetch --depth 1 upstream "refs/tags/$GE_TAG:refs/dsx-build/$GE_TAG"
+          git -C pgc checkout "refs/dsx-build/$GE_TAG"
+          git -C pgc submodule update --init --depth 1 --jobs "$(nproc)"
 
       - name: Restore ccache
         uses: actions/cache@v4
@@ -123,19 +130,20 @@ jobs:
           key: dsx-ge-ccache-${{ env.GE_TAG }}
           restore-keys: dsx-ge-ccache-
 
-      - name: Regenerate hook patch and stage DSX patches
+      - name: Hook unit tests and patch drift check
+        # Fast fail before the multi-hour build: the hook logic must pass and
+        # the committed 0014 patch must still apply to this upstream tag.
+        # Anchor drift fails here with the regen command instead of shipping
+        # a hookless build.
         run: |
           set -euo pipefail
-          HOOK=proton-patches/proton/0014-proton-auto-enable-dsx-proxy.patch
-          python3 dsx/tools/gen_proton_hook_patch.py "$GITHUB_WORKSPACE/pgc" "$GITHUB_WORKSPACE/regen.patch"
-          if ! diff -q "dsx/$HOOK" "$GITHUB_WORKSPACE/regen.patch" >/dev/null; then
-            echo "FAIL: upstream moved the proton-script anchor; $HOOK is stale."
-            echo "Regenerate locally and commit to DualsenseXLinux first:"
-            echo "  python3 tools/gen_proton_hook_patch.py proton-ge-custom \\"
-            echo "      proton-patches/proton/0014-proton-auto-enable-dsx-proxy.patch"
-            exit 1
-          fi
-          (cd dsx && tools/sync-proton-patches.sh "$GITHUB_WORKSPACE/pgc")
+          python3 -m pytest tests/proton_dsx_hook_test.py -q
+          bash tests/gen_proton_hook_patch_test.sh "$GITHUB_WORKSPACE/pgc"
+
+      - name: Stage DSX patches
+        run: |
+          set -euo pipefail
+          tools/stage-dsx-patches.sh "$GITHUB_WORKSPACE/pgc"
 
       - name: protonprep
         working-directory: pgc
@@ -181,8 +189,14 @@ jobs:
           tar czf "$GITHUB_WORKSPACE/DSX-GE.tar.gz" -C stage DSX-GE
           ls -la "$GITHUB_WORKSPACE/DSX-GE.tar.gz"
 
+      - name: Package script self-test
+        # Synthetic tarball check of the packager (hook present/absent
+        # paths) before trusting it with the real multi-hour build output.
+        run: |
+          set -euo pipefail
+          bash tests/package_dsx_ge_test.sh
+
       - name: Package DSX-GE
-        working-directory: dsx
         env:
           DSX_GE_BASE_URL: https://github.com/${{ github.repository }}/releases/latest/download
         run: |
@@ -193,7 +207,7 @@ jobs:
       - name: Publish release
         # Same repo: GITHUB_TOKEN suffices. Tag "11.5" matches the existing
         # manual release format and never matches GE's GE-Proton* patterns.
-        working-directory: dsx/dist
+        working-directory: dist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
