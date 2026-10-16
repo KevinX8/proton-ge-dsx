@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# The committed 0014 patch must match what the generator produces against the
-# target proton-ge-custom checkout, and must apply to a pristine `proton` to
-# produce valid Python with the restore call wired in.
+# The committed 0014 patch must carry the same payload the generator produces
+# from tools/dsx_proton_hook.py, and must apply to a pristine `proton` to
+# produce valid Python with the restore call wired in. Plain upstream
+# line-number drift is not a failure: `patch` relocates the hunks itself.
 #
 # Usage: tests/gen_proton_hook_patch_test.sh [<proton-ge-custom checkout>]
 # Defaults to this repo, which is itself a proton-ge-custom fork.
@@ -14,8 +15,13 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 python3 "$repo_root/tools/gen_proton_hook_patch.py" "$pgc" "$work/regenerated.patch"
-if ! diff -u "$committed" "$work/regenerated.patch"; then
-    echo "FAIL: upstream moved the proton-script anchor; the committed patch is stale." >&2
+# Compare the payload, not the raw text: a hunk header ("@@ -233,6 +233,216
+# @@") carries the upstream line number, which shifts whenever anything above
+# the anchor changes. Comparing text therefore fails on every GE release that
+# touches `proton` at all - even though `patch` relocates the hunk by itself,
+# which the apply check below proves. Only the added/removed lines matter.
+if ! diff -u <(grep -v '^@@' "$committed") <(grep -v '^@@' "$work/regenerated.patch"); then
+    echo "FAIL: the committed 0014 patch no longer matches tools/dsx_proton_hook.py." >&2
     echo "      Regenerate and commit the result in this repo:" >&2
     echo "        python3 tools/gen_proton_hook_patch.py $pgc \\" >&2
     echo "            patches/dsx-proton/0014-proton-auto-enable-dsx-proxy.patch" >&2
