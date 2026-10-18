@@ -222,6 +222,9 @@ jobs:
           test "$(ls -1 stage | wc -l)" -eq 1
           mv "stage/$(ls -1 stage)" stage/DSX-GE
           echo "$(date +%s) $VERSION" > stage/DSX-GE/version
+          # Steam lists the tool by display_name; GE's build names it after the upstream tag.
+          sed -i "s/\"display_name\" \"[^\"]*\"/\"display_name\" \"Proton-DSX-GE-$VERSION\"/" stage/DSX-GE/compatibilitytool.vdf
+          grep -q "\"Proton-DSX-GE-$VERSION\"" stage/DSX-GE/compatibilitytool.vdf
           grep -q 'BEGIN DSX PROXY HOOK' stage/DSX-GE/proton
           tar czf "$GITHUB_WORKSPACE/DSX-GE.tar.gz" -C stage DSX-GE
           ls -la "$GITHUB_WORKSPACE/DSX-GE.tar.gz"
