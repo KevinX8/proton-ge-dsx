@@ -54,13 +54,12 @@ def control_request(payload):
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
 
 
-def dialog_command(reason):
+def dialog_command(text):
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
     if "KDE" in desktop:
         order = ["kdialog", "zenity", "yad"]
     else:
         order = ["zenity", "kdialog", "yad"]
-    text = "DSX proxy could not be enabled.\n\n%s\n\nLaunch anyway?" % reason
     for name in order:
         path = shutil.which(name)
         if path is None:
@@ -71,8 +70,10 @@ def dialog_command(reason):
     return None
 
 
-def ask(reason):
-    command = dialog_command(reason)
+def ask(message):
+    text = message.get("text") or (
+        "DSX proxy could not be enabled.\n\n%s\n\nLaunch anyway?" % message.get("reason", ""))
+    command = dialog_command(text)
     if command is None:
         return {"ok": True, "answer": "nodialog"}
     try:
@@ -97,7 +98,7 @@ def main():
         settings = message.get("settings") or {}
         result = control_request(dict(settings, command="set_runtime"))
     elif operation == "ask":
-        result = ask(message.get("reason", ""))
+        result = ask(message)
     else:
         result = {"ok": False, "error": "unknown_op"}
     print(json.dumps(result))
@@ -146,10 +147,12 @@ def dsx_host_call(message, timeout=DSX_CALL_TIMEOUT):
         return None
 
 
-def dsx_ask_or_abort(reason):
+def dsx_ask_or_abort(reason, text=None):
     """Ask whether to launch despite a failure. True means launch."""
-    reply = dsx_host_call({"op": "ask", "reason": reason},
-                          timeout=DSX_DIALOG_CALL_TIMEOUT)
+    message = {"op": "ask", "reason": reason}
+    if text:
+        message["text"] = text
+    reply = dsx_host_call(message, timeout=DSX_DIALOG_CALL_TIMEOUT)
     if reply is None or not reply.get("ok"):
         dsx_log("could not ask, launching anyway")
         return True
@@ -174,6 +177,28 @@ def dsx_game_appid():
     return appid
 
 
+DSX_DUALSENSE_IDS = {("054c", "0ce6"), ("054c", "0df2")}
+DSX_STEAM_INPUT_TEXT = (
+    "Steam Input is on for this game, so it sees an Xbox controller instead "
+    "of your DualSense. Haptics and adaptive triggers won't work.\n\n"
+    "Turn it off in the game's Properties > Controller > Disable Steam Input.\n\n"
+    "Launch anyway?")
+
+
+def dsx_steam_input_hides_dualsense():
+    """True when Steam Input took the DualSense over for this launch.
+
+    Steam hides each controller it translates from the game by listing its
+    USB ids ("0x054c/0x0ce6,...") in SDL_GAMECONTROLLER_IGNORE_DEVICES.
+    """
+    for entry in os.environ.get("SDL_GAMECONTROLLER_IGNORE_DEVICES", "").split(","):
+        ids = tuple(part.strip().lower().replace("0x", "").zfill(4)
+                    for part in entry.split("/"))
+        if ids in DSX_DUALSENSE_IDS:
+            return True
+    return False
+
+
 def dsx_enable_proxy():
     """Enable proxy mode before a game launches.
 
@@ -183,6 +208,10 @@ def dsx_enable_proxy():
     if dsx_game_appid() is None:
         dsx_log("no game AppID, skipping proxy control")
         return True, None
+    if dsx_steam_input_hides_dualsense():
+        dsx_log("Steam Input is on for the DualSense")
+        if not dsx_ask_or_abort("steam_input", DSX_STEAM_INPUT_TEXT):
+            return False, None
     status = dsx_host_call({"op": "status"})
     if status is None:
         return True, None

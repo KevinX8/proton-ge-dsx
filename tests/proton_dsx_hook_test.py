@@ -141,6 +141,7 @@ def container(hook, fake_bin, stub_env, monkeypatch):
     monkeypatch.delenv("XDG_CURRENT_DESKTOP", raising=False)
     monkeypatch.setenv("SteamGameId", "12345")
     monkeypatch.delenv("STEAM_COMPAT_APP_ID", raising=False)
+    monkeypatch.delenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", raising=False)
     return hook
 
 
@@ -315,3 +316,44 @@ def test_stage_patches_in_place_is_idempotent(tmp_path):
     assert prep.read_text() == first
     assert first.count('apply_all_in_dir "../patches/dsx"') == 1
     assert first.count('apply_all_in_dir "patches/dsx-proton"') == 1
+
+
+@pytest.mark.parametrize("value, hidden", [
+    ("0x054c/0x0ce6", True),
+    ("0x28de/0x11ff,0x054C/0x0DF2", True),
+    ("0x054c/0x09cc", False),
+    ("", False),
+    ("garbage", False),
+])
+def test_steam_input_detection_reads_the_ignore_list(container, monkeypatch, value, hidden):
+    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", value)
+    assert container.dsx_steam_input_hides_dualsense() is hidden
+
+
+def test_steam_input_warning_cancels_launch_when_declined(container, fake_bin, control_server, monkeypatch):
+    server = control_server(SNAPSHOT)
+    log = fake_bin.directory.parent / "dialog-args"
+    fake_bin("zenity", 'echo "$@" > "%s"; exit 1' % log)
+    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x054c/0x0ce6")
+    assert container.dsx_enable_proxy() == (False, None)
+    assert "Steam Input is on for this game" in log.read_text()
+    assert server.requests == []
+
+
+def test_steam_input_warning_launches_when_accepted(container, fake_bin, control_server, monkeypatch):
+    server = control_server(SNAPSHOT)
+    fake_bin("zenity", "exit 0")
+    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x054c/0x0ce6")
+    should_launch, snapshot = container.dsx_enable_proxy()
+    assert should_launch is True
+    assert snapshot is not None
+    assert server.requests[-1]["proxy_enabled"] is True
+
+
+def test_no_steam_input_warning_without_the_dualsense_hidden(container, fake_bin, control_server):
+    control_server(SNAPSHOT)
+    marker = fake_bin.directory.parent / "dialog-was-shown"
+    fake_bin("zenity", 'touch "%s"; exit 1' % marker)
+    should_launch, _ = container.dsx_enable_proxy()
+    assert should_launch is True
+    assert not marker.exists()
