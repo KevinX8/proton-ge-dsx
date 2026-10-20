@@ -78,8 +78,18 @@ jobs:
           # GE-Proton11-5 -> 11.5, matching our existing release tags.
           version="${ge_tag#GE-Proton}"
           version="${version//-/.}"
-          published=$(gh release list --limit 100 --json tagName --jq '.[].tagName' | grep -xF "$version" || true)
+          tags=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          published=$(grep -xF "$version" <<<"$tags" || true)
           echo "upstream_tag=$ge_tag version=$version published=$([ -n "$published" ] && echo yes || echo no)"
+          # A forced rebuild of a published tag (DSX patch change, same GE) gets
+          # the next free "-rN" so the GUI, which compares version strings,
+          # offers it as an update instead of overwriting the release.
+          if [ "$FORCE" = "true" ] && [ -n "$published" ]; then
+            revision=2
+            while grep -qxF "$version-r$revision" <<<"$tags"; do revision=$((revision + 1)); done
+            version="$version-r$revision"
+            echo "forced rebuild publishes as $version"
+          fi
           if [ "$FORCE" = "true" ] || [ -z "$published" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
