@@ -55,7 +55,11 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 (what ubuntu-latest moved to on 2026-10-19) cannot run the
+    # repo's wineboot inside the steamrt4 container: it dies with "wine: socket :
+    # Function not implemented" while building default_pfx, so the 11.12 build
+    # failed twice. 24.04 is the last host that built a release (11.11).
+    runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.compare.outputs.build }}
       ge_tag: ${{ steps.compare.outputs.ge_tag }}
@@ -103,7 +107,11 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 (what ubuntu-latest moved to on 2026-10-19) cannot run the
+    # repo's wineboot inside the steamrt4 container: it dies with "wine: socket :
+    # Function not implemented" while building default_pfx, so the 11.12 build
+    # failed twice. 24.04 is the last host that built a release (11.11).
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     timeout-minutes: 360
