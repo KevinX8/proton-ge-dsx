@@ -23,9 +23,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 
 SOCKET_NAME = "dsx-linux/control.sock"
 CONNECT_TIMEOUT = 1.0
+MIN_ANSWER_SECONDS = 0.5
 DIALOG_TIMEOUT = float(os.environ.get("DSX_DIALOG_TIMEOUT", "30"))
 
 
@@ -76,13 +78,20 @@ def ask(message):
     command = dialog_command(text)
     if command is None:
         return {"ok": True, "answer": "nodialog"}
+    started = time.monotonic()
     try:
         completed = subprocess.run(command, timeout=DIALOG_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {"ok": True, "answer": "timeout"}
     except OSError:
         return {"ok": True, "answer": "nodialog"}
-    return {"ok": True, "answer": "yes" if completed.returncode == 0 else "no"}
+    if completed.returncode == 0:
+        return {"ok": True, "answer": "yes"}
+    # A dialog that cannot open (no display, Game Mode) exits 1 at once, the
+    # same code as "No"; only a dialog that stayed up long enough to read counts.
+    if completed.returncode == 1 and time.monotonic() - started >= MIN_ANSWER_SECONDS:
+        return {"ok": True, "answer": "no"}
+    return {"ok": True, "answer": "nodialog"}
 
 
 def main():
@@ -199,6 +208,27 @@ def dsx_steam_input_hides_dualsense():
     return False
 
 
+DSX_RUNTIME_KEYS = (
+    "proxy_enabled", "ignore_game_output", "xbox_emulation_enabled",
+    "audio_haptics_enabled", "dualshock4_emulation_enabled", "rumble_enabled",
+    "rumble_intensity", "bt_link_limit_percent", "haptics_buffer_ms",
+    "experimental_direct_bt_audio", "haptics_source", "input_rate_hz",
+    "low_battery_alert_enabled", "low_battery_threshold", "low_battery_interval_s",
+    "low_battery_repeat", "audio_enabled", "mirror_audio", "verbose", "microphone",
+    "pad_source_order", "pad_haptics_strength", "rumble_pad_audio_haptics",
+)
+DSX_MODE_KEYS = ("proxy_enabled", "xbox_emulation_enabled")
+
+
+def dsx_runtime_fields(status):
+    """The runtime block of a status reply, ready to send back in set_runtime.
+
+    The service persists every field it receives, so a request must carry the
+    whole block; a missing field would fall back to its compiled default.
+    """
+    return {key: status[key] for key in DSX_RUNTIME_KEYS if key in status}
+
+
 def dsx_enable_proxy():
     """Enable proxy mode before a game launches.
 
@@ -220,16 +250,9 @@ def dsx_enable_proxy():
     if status.get("proxy_enabled"):
         dsx_log("proxy already enabled, leaving as-is")
         return True, None
-    previous = {
-        "proxy_enabled": False,
-        "ignore_game_output": bool(status.get("ignore_game_output")),
-        "xbox_emulation_enabled": bool(status.get("xbox_emulation_enabled")),
-    }
-    reply = dsx_host_call({"op": "set", "settings": {
-        "proxy_enabled": True,
-        "ignore_game_output": previous["ignore_game_output"],
-        "xbox_emulation_enabled": False,
-    }})
+    previous = dict(dsx_runtime_fields(status), proxy_enabled=False)
+    reply = dsx_host_call({"op": "set", "settings": dict(
+        previous, proxy_enabled=True, xbox_emulation_enabled=False)})
     if reply is None:
         return True, None
     if not reply.get("ok"):
@@ -242,7 +265,14 @@ def dsx_restore_proxy(snapshot):
     """Restore the runtime settings captured before launch."""
     if snapshot is None:
         return
-    reply = dsx_host_call({"op": "set", "settings": snapshot})
+    # Only the mode switches the hook changed go back; settings edited while
+    # the game ran are kept.
+    settings = snapshot
+    status = dsx_host_call({"op": "status"})
+    if status is not None and status.get("ok"):
+        settings = dsx_runtime_fields(status)
+        settings.update({key: snapshot[key] for key in DSX_MODE_KEYS if key in snapshot})
+    reply = dsx_host_call({"op": "set", "settings": settings})
     if reply is None or not reply.get("ok"):
         dsx_log("failed to restore previous proxy state")
         return

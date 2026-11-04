@@ -87,10 +87,19 @@ def test_ask_reports_yes_when_dialog_accepts(hook, fake_bin, stub_env):
 
 
 def test_ask_reports_no_when_dialog_declines(hook, fake_bin, stub_env):
-    fake_bin("zenity", "exit 1")
+    fake_bin("zenity", "%s 0.6; exit 1" % fake_bin.real_sleep)
     stub_env["PATH"] = str(fake_bin.directory)
     result = run_stub(hook, {"op": "ask", "reason": "socket_missing"}, stub_env)
     assert json.loads(result.stdout) == {"ok": True, "answer": "no"}
+
+
+@pytest.mark.parametrize("script", ["exit 1", "exit 134"])
+def test_ask_reports_nodialog_when_dialog_cannot_open(hook, fake_bin, stub_env, script):
+    # zenity without a display exits 1 at once, the same code as "No".
+    fake_bin("zenity", script)
+    stub_env["PATH"] = str(fake_bin.directory)
+    result = run_stub(hook, {"op": "ask", "reason": "socket_missing"}, stub_env)
+    assert json.loads(result.stdout) == {"ok": True, "answer": "nodialog"}
 
 
 def test_ask_reports_nodialog_when_no_tool_present(hook, fake_bin, stub_env):
@@ -172,6 +181,37 @@ def test_enable_proxy_enables_and_returns_snapshot(container, control_server):
     }
 
 
+RICH_STATUS = dict(
+    SNAPSHOT,
+    audio_haptics_enabled=False,
+    rumble_intensity=3,
+    input_rate_hz=500,
+    haptics_source="app:Game",
+    haptics_buffer_ms=25,
+    low_battery_alert_enabled=False,
+    low_battery_threshold=10,
+    low_battery_interval_s=60,
+    low_battery_repeat=2,
+    audio_enabled=False,
+    mirror_audio=True,
+    verbose=True,
+    microphone="disabled",
+    pad_source_order="handheld,dualsense,steam_controller",
+    pad_haptics_strength=150,
+    rumble_pad_audio_haptics=True,
+)
+
+
+def test_enable_proxy_sends_every_runtime_field_back(container, control_server):
+    server = control_server(RICH_STATUS)
+    _, snapshot = container.dsx_enable_proxy()
+    runtime = {k: v for k, v in RICH_STATUS.items()
+               if k not in ("ok", "controller_connected", "battery_level")}
+    assert snapshot == dict(runtime, proxy_enabled=False)
+    assert server.requests[-1] == dict(
+        runtime, proxy_enabled=True, xbox_emulation_enabled=False, command="set_runtime")
+
+
 def test_enable_proxy_forces_xbox_off(container, control_server):
     server = control_server(dict(SNAPSHOT, xbox_emulation_enabled=True))
     _, snapshot = container.dsx_enable_proxy()
@@ -193,7 +233,7 @@ def test_enable_proxy_launches_anyway_when_host_unreachable(hook, monkeypatch, t
 
 
 def test_enable_proxy_aborts_when_dialog_declines(container, fake_bin):
-    fake_bin("zenity", "exit 1")
+    fake_bin("zenity", "%s 0.6; exit 1" % fake_bin.real_sleep)
     should_launch, snapshot = container.dsx_enable_proxy()
     assert should_launch is False
     assert snapshot is None
@@ -206,13 +246,22 @@ def test_enable_proxy_launches_when_dialog_accepts(container, fake_bin):
     assert snapshot is None
 
 
-def test_restore_sends_the_snapshot(container, control_server):
-    server = control_server(SNAPSHOT)
-    snapshot = {
-        "proxy_enabled": False,
-        "ignore_game_output": True,
-        "xbox_emulation_enabled": True,
-    }
+def test_restore_puts_back_the_modes_and_keeps_settings_changed_in_game(container, control_server):
+    server = control_server(dict(RICH_STATUS, proxy_enabled=True))
+    snapshot = dict(SNAPSHOT, proxy_enabled=False, xbox_emulation_enabled=True,
+                    input_rate_hz=0, rumble_intensity=10)
+    snapshot = {k: v for k, v in snapshot.items()
+                if k not in ("ok", "controller_connected", "battery_level")}
+    container.dsx_restore_proxy(snapshot)
+    runtime = {k: v for k, v in RICH_STATUS.items()
+               if k not in ("ok", "controller_connected", "battery_level")}
+    assert server.requests[-1] == dict(
+        runtime, proxy_enabled=False, xbox_emulation_enabled=True, command="set_runtime")
+
+
+def test_restore_sends_the_snapshot_when_status_fails(container, control_server):
+    server = control_server({"ok": False, "error": "busy"})
+    snapshot = {"proxy_enabled": False, "xbox_emulation_enabled": True}
     container.dsx_restore_proxy(snapshot)
     assert server.requests[-1] == dict(snapshot, command="set_runtime")
 
@@ -260,6 +309,47 @@ def test_enable_proxy_honours_steam_compat_app_id(container, control_server, mon
     assert should_launch is True
     assert snapshot is not None
     assert server.requests[-1]["proxy_enabled"] is True
+
+
+@pytest.mark.parametrize("value, hidden", [
+    ("0x054c/0x0ce6", True),
+    ("0x28de/0x11ff,0x054C/0x0DF2", True),
+    ("0x054c/0x09cc", False),
+    ("", False),
+    ("garbage", False),
+])
+def test_steam_input_detection_reads_the_ignore_list(container, monkeypatch, value, hidden):
+    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", value)
+    assert container.dsx_steam_input_hides_dualsense() is hidden
+
+
+def test_steam_input_warning_cancels_launch_when_declined(container, fake_bin, control_server, monkeypatch):
+    server = control_server(SNAPSHOT)
+    log = fake_bin.directory.parent / "dialog-args"
+    fake_bin("zenity", 'echo "$@" > "%s"; %s 0.6; exit 1' % (log, fake_bin.real_sleep))
+    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x054c/0x0ce6")
+    assert container.dsx_enable_proxy() == (False, None)
+    assert "Steam Input is on for this game" in log.read_text()
+    assert server.requests == []
+
+
+def test_steam_input_warning_launches_when_accepted(container, fake_bin, control_server, monkeypatch):
+    server = control_server(SNAPSHOT)
+    fake_bin("zenity", "exit 0")
+    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x054c/0x0ce6")
+    should_launch, snapshot = container.dsx_enable_proxy()
+    assert should_launch is True
+    assert snapshot is not None
+    assert server.requests[-1]["proxy_enabled"] is True
+
+
+def test_no_steam_input_warning_without_the_dualsense_hidden(container, fake_bin, control_server):
+    control_server(SNAPSHOT)
+    marker = fake_bin.directory.parent / "dialog-was-shown"
+    fake_bin("zenity", 'touch "%s"; exit 1' % marker)
+    should_launch, _ = container.dsx_enable_proxy()
+    assert should_launch is True
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("cancel,fail", [(False, False), (False, True), (True, False)])
@@ -316,44 +406,3 @@ def test_stage_patches_in_place_is_idempotent(tmp_path):
     assert prep.read_text() == first
     assert first.count('apply_all_in_dir "../patches/dsx"') == 1
     assert first.count('apply_all_in_dir "patches/dsx-proton"') == 1
-
-
-@pytest.mark.parametrize("value, hidden", [
-    ("0x054c/0x0ce6", True),
-    ("0x28de/0x11ff,0x054C/0x0DF2", True),
-    ("0x054c/0x09cc", False),
-    ("", False),
-    ("garbage", False),
-])
-def test_steam_input_detection_reads_the_ignore_list(container, monkeypatch, value, hidden):
-    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", value)
-    assert container.dsx_steam_input_hides_dualsense() is hidden
-
-
-def test_steam_input_warning_cancels_launch_when_declined(container, fake_bin, control_server, monkeypatch):
-    server = control_server(SNAPSHOT)
-    log = fake_bin.directory.parent / "dialog-args"
-    fake_bin("zenity", 'echo "$@" > "%s"; exit 1' % log)
-    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x054c/0x0ce6")
-    assert container.dsx_enable_proxy() == (False, None)
-    assert "Steam Input is on for this game" in log.read_text()
-    assert server.requests == []
-
-
-def test_steam_input_warning_launches_when_accepted(container, fake_bin, control_server, monkeypatch):
-    server = control_server(SNAPSHOT)
-    fake_bin("zenity", "exit 0")
-    monkeypatch.setenv("SDL_GAMECONTROLLER_IGNORE_DEVICES", "0x054c/0x0ce6")
-    should_launch, snapshot = container.dsx_enable_proxy()
-    assert should_launch is True
-    assert snapshot is not None
-    assert server.requests[-1]["proxy_enabled"] is True
-
-
-def test_no_steam_input_warning_without_the_dualsense_hidden(container, fake_bin, control_server):
-    control_server(SNAPSHOT)
-    marker = fake_bin.directory.parent / "dialog-was-shown"
-    fake_bin("zenity", 'touch "%s"; exit 1' % marker)
-    should_launch, _ = container.dsx_enable_proxy()
-    assert should_launch is True
-    assert not marker.exists()

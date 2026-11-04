@@ -196,9 +196,10 @@ jobs:
             tail -30 "$GITHUB_WORKSPACE/patchlog.txt"
             exit 1
           }
-          # Patch noise ("0 failed", "no errors") must not fail the build.
-          if grep -iE "fail|error|hunk|can't find|not found" "$GITHUB_WORKSPACE/patchlog.txt" \
-              | grep -viE "0 fail|0 error|no .*fail" | head -5; then
+          # Patch noise ("0 failed", "no errors") and hunks that applied at an offset
+          # ("Hunk #1 succeeded at 860 (offset 125 lines)") must not fail the build.
+          if grep -iE "fail|error|fatal:|can't find|not found|reversed|previously applied" "$GITHUB_WORKSPACE/patchlog.txt" \
+              | grep -viE "0 fail|0 error|no .*fail|succeeded" | head -5; then
             echo "patch failures detected"; exit 1
           fi
           grep -A4 'WINE: -DSX-' "$GITHUB_WORKSPACE/patchlog.txt" | head -8
