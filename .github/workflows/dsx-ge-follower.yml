@@ -165,7 +165,7 @@ jobs:
             --jobs "$(nproc)"
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ccache
           key: dsx-ge-ccache-${{ env.GE_TAG }}
@@ -212,10 +212,40 @@ jobs:
           mkdir -p build && cd build
           ccache -z || true
           ../configure.sh --build-name="$GE_TAG" --container-engine=docker
-          make -j"$(nproc)" redist
+          # The full make output is ~60 MB, past what GitHub keeps for a step, so
+          # it goes to a file (uploaded on failure) with a progress line every 5 min.
+          ( while sleep 300; do echo "still building: $(wc -l < "$GITHUB_WORKSPACE/build.log") log lines, $(df -h / | awk 'NR==2{print $4}') free"; done ) &
+          progress=$!
+          if ! make -j"$(nproc)" redist > "$GITHUB_WORKSPACE/build.log" 2>&1; then
+            kill "$progress" || true
+            echo "::group::make errors"
+            grep -nE '\] Error [0-9]+|: (fatal )?error: |error: linker|undefined reference|No space left|Killed|error\[E[0-9]+\]|\*\*\* ' "$GITHUB_WORKSPACE/build.log" | head -60 || true
+            echo "::endgroup::"
+            tail -150 "$GITHUB_WORKSPACE/build.log"
+            df -h /
+            exit 1
+          fi
+          kill "$progress" || true
           ccache -s || true
           test "$(ls -1 ./*.tar.gz | wc -l)" -eq 1
           ls -la ./*.tar.gz
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.GE_TAG }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Save ccache
+        # Saved even when the build fails, so a retry does not start from scratch.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: dsx-ge-ccache-${{ env.GE_TAG }}-${{ github.run_id }}
 
       - name: Stage DSX-GE layout
         # GE's tarball carries its own top dir and version file. Repack it
